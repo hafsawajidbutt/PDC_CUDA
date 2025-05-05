@@ -13,6 +13,7 @@
 #include "CycleTimer.h"
 
 #define THREADS_PER_BLOCK 256
+#define BLOCK_SIZE 512
 
 
 // helper function to round an integer up to the next power of 2
@@ -42,19 +43,49 @@ static inline int nextPow2(int n) {
 // Also, as per the comments in cudaScan(), you can implement an
 // "in-place" scan, since the timing harness makes a copy of input and
 // places it in result
-void exclusive_scan(int* input, int N, int* result)
-{
+__global__ void scanKernel(int *d_in, int *d_out, int N) {
+    __shared__ int temp[BLOCK_SIZE * 2];  // Temporary storage for the scan
 
-    // CS149 TODO:
-    //
-    // Implement your exclusive scan implementation here.  Keep in
-    // mind that although the arguments to this function are device
-    // allocated arrays, this is a function that is running in a thread
-    // on the CPU.  Your implementation will need to make multiple calls
-    // to CUDA kernel functions (that you must write) to implement the
-    // scan.
+    int thid = threadIdx.x;
+    int offset = 1;
 
+    // Load input into shared memory
+    temp[2 * thid] = d_in[2 * thid];
+    temp[2 * thid + 1] = d_in[2 * thid + 1];
 
+    // Perform the scan in parallel
+    for (int d = BLOCK_SIZE >> 1; d > 0; d >>= 1) {
+        __syncthreads();
+        if (thid < d) {
+            int ai = offset * (2 * thid + 1) - 1;
+            int bi = offset * (2 * thid + 2) - 1;
+            temp[bi] += temp[ai];
+        }
+        offset <<= 1;
+    }
+
+    // Write the results to the output array
+    if (thid == 0) {
+        d_out[0] = temp[BLOCK_SIZE * 2 - 1];
+    }
+    for (int i = 1; i < BLOCK_SIZE; i++) {
+        d_out[i] = temp[i];
+    }
+}
+void exclusive_scan(int *d_in, int N, int *d_out) {
+    int *d_in_temp, *d_out_temp;
+    cudaMalloc(&d_in_temp, sizeof(int) * N);
+    cudaMalloc(&d_out_temp, sizeof(int) * N);
+
+    cudaMemcpy(d_in_temp, d_in, sizeof(int) * N, cudaMemcpyHostToDevice);
+
+    int numBlocks = (N + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    scanKernel<<<numBlocks, BLOCK_SIZE>>>(d_in_temp, d_out_temp, N);
+
+    cudaMemcpy(d_out, d_out_temp, sizeof(int) * N, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_in_temp);
+    cudaFree(d_out_temp);
 }
 
 
@@ -141,29 +172,40 @@ double cudaScanThrust(int* inarray, int* end, int* resultarray) {
 }
 
 
+__global__ void findRepeatsKernel(int *d_array, int *d_repeats, int N) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+
+    if (idx < N) {
+        for (int i = idx + 1; i < N; i++) {
+            if (d_array[idx] == d_array[i]) {
+                d_repeats[idx] = 1;  // Mark as a repeat
+                d_repeats[i] = 1;    // Mark as a repeat
+            }
+        }
+    }
+}
 // find_repeats --
 //
 // Given an array of integers `device_input`, returns an array of all
 // indices `i` for which `device_input[i] == device_input[i+1]`.
 //
 // Returns the total number of pairs found
-int find_repeats(int* device_input, int length, int* device_output) {
+int find_repeats(int *d_array, int N, int *d_repeats) {
+    int *d_array_temp, *d_repeats_temp;
+    cudaMalloc(&d_array_temp, sizeof(int) * N);
+    cudaMalloc(&d_repeats_temp, sizeof(int) * N);
 
-    // CS149 TODO:
-    //
-    // Implement this function. You will probably want to
-    // make use of one or more calls to exclusive_scan(), as well as
-    // additional CUDA kernel launches.
-    //    
-    // Note: As in the scan code, the calling code ensures that
-    // allocated arrays are a power of 2 in size, so you can use your
-    // exclusive_scan function with them. However, your implementation
-    // must ensure that the results of find_repeats are correct given
-    // the actual array length.
+    cudaMemcpy(d_array_temp, d_array, sizeof(int) * N, cudaMemcpyHostToDevice);
 
-    return 0; 
+    int numBlocks = (N + 512 - 1) / 512;
+    findRepeatsKernel<<<numBlocks, 512>>>(d_array_temp, d_repeats_temp, N);
+
+    cudaMemcpy(d_repeats, d_repeats_temp, sizeof(int) * N, cudaMemcpyDeviceToHost);
+
+    cudaFree(d_array_temp);
+    cudaFree(d_repeats_temp);
+    return 0;
 }
-
 
 //
 // cudaFindRepeats --
